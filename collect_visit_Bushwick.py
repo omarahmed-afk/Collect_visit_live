@@ -334,10 +334,11 @@ def sync_visit_rows(ws, rows, headers):
 
       same key, same Count       -> nothing is written
       same key, other Count      -> only column E of that row
-      a row whose key is no longer on the page + a new key for the same
-      clinic + date (type changed, e.g. Initial Examination -> Follow-Up,
-      or the time moved)         -> that SAME row is rewritten, no new row
-                                    (a row with the same Time is preferred)
+      a row whose key is no longer on the page + a new key with the same
+      clinic + date + TIME (type changed, e.g. Initial Examination ->
+      Follow-Up)                 -> that SAME row is rewritten, no new row
+      a time with nobody left    -> its row is deleted (a new time gets a
+                                    new row)
       new key, no row to reuse   -> appended
       row no longer on the page and nothing replaces it -> row deleted,
                                     never left at 0
@@ -384,9 +385,9 @@ def sync_visit_rows(ws, rows, headers):
             continue
         scope = (k[0], k[1])
         free = [] if scope in _INCOMPLETE_SCOPES else spare.get(scope, [])
-        if free:
-            same_time = [n for n in free if _visit_key(existing[n - 1])[2] == k[2]]
-            n = (same_time or free)[0]
+        same_time = [n for n in free if _visit_key(existing[n - 1])[2] == k[2]]
+        if same_time:
+            n = same_time[0]          # same clinic + date + TIME, type changed
             free.remove(n)
             log.info(f"  -  Row {n}: {existing[n - 1][2:5]} -> {r[2:5]} (same row)")
             updates.append({"range": f"A{n}:E{n}", "values": [r]})
@@ -412,13 +413,14 @@ def sync_visit_rows(ws, rows, headers):
         except Exception as e:
             ok_so_far = False
             log.error(f"Updating rows failed: {e}")
-    if appends:
-        try:
-            _api(ws.append_rows, appends, value_input_option="RAW")
-            log.info(f"Added {len(appends)} new row(s)")
-        except Exception as e:
-            ok_so_far = False
-            log.error(f"Adding rows failed: {e}")
+
+    # the layout as it is now, to find where new rows belong
+    current = [list(r) for r in existing]
+    for u in updates:
+        m = re.match(r"A(\d+):E\1$", u["range"])
+        if m:
+            current[int(m.group(1)) - 1] = list(u["values"][0])
+
     if deletes and ok_so_far:
         order = sorted(set(deletes), reverse=True)     # bottom first
         for n in order:
@@ -427,13 +429,69 @@ def sync_visit_rows(ws, rows, headers):
             requests = [{"deleteDimension": {"range": {
                 "sheetId": ws.id, "dimension": "ROWS",
                 "startIndex": n - 1, "endIndex": n}}} for n in order]
-            _api(ws.spreadsheet.batch_update, {"requests": requests})
-        except AttributeError:
+            try:
+                _api(ws.spreadsheet.batch_update, {"requests": requests})
+            except AttributeError:
+                for n in order:
+                    _api(ws.delete_rows, n)
             for n in order:
-                _api(ws.delete_rows, n)
+                del current[n - 1]
         except Exception as e:
             log.error(f"Deleting rows failed: {e}")
+
+    if appends and ok_so_far:
+        _insert_in_order(ws, current, appends)
+    elif appends:
+        log.warning(f"{len(appends)} new row(s) not added because an earlier step failed "
+                    f"- they are sent again at the next publish")
     return ok_so_far
+
+
+def _visit_sort_key(r):
+    """(date, time, clinic, type) - 'No appointments' (no time) sorts first."""
+    k = _visit_key(r)
+    if not k:
+        return None
+    clinic, date, tm, typ = k
+    return (date, tm if re.match(r"^\d{2}:\d{2}$", tm) else "", clinic, typ)
+
+
+def _insert_in_order(ws, current, new_rows):
+    """Inserts each new row under its own day, right after the last time that
+    comes before it (before the first row that sorts after it) - not at the
+    bottom of the tab. Falls back to appending if inserting fails."""
+    plan = []
+    for r in sorted(new_rows, key=_visit_sort_key):
+        sk = _visit_sort_key(r)
+        idx = len(current)
+        for i in range(1, len(current)):
+            ck = _visit_sort_key(current[i])
+            if ck is not None and ck > sk:
+                idx = i
+                break
+        current.insert(idx, list(r))
+        plan.append((idx, list(r)))
+    try:
+        requests = [{"insertDimension": {
+            "range": {"sheetId": ws.id, "dimension": "ROWS",
+                      "startIndex": idx, "endIndex": idx + 1},
+            "inheritFromBefore": idx > 1}} for idx, _ in plan]
+        try:
+            _api(ws.spreadsheet.batch_update, {"requests": requests})
+        except AttributeError:
+            for idx, _ in plan:
+                _api(ws.insert_rows, [[""] * 5], row=idx + 1)
+        values = [{"range": f"A{idx + 1}:E{idx + 1}", "values": [r]} for idx, r in plan]
+        try:
+            _api(ws.batch_update, values, value_input_option="RAW")
+        except TypeError:
+            _api(ws.batch_update, values)
+        for idx, r in plan:
+            log.info(f"  -  New row {idx + 1}: {r}")
+        log.info(f"Inserted {len(plan)} new row(s) in date/time order")
+    except Exception as e:
+        log.error(f"Inserting rows in order failed ({e}) - adding them at the bottom")
+        _api(ws.append_rows, [r for _, r in plan], value_input_option="RAW")
 
 
 # =====================================================================
@@ -3187,7 +3245,9 @@ _HOVER_TOOLTIP_JS = r"""
         .filter(l => !/last\s*change|edited\s*by|created\s*by/i.test(l)).join('\n');
     const own = t => Boolean(hint) && norm(t).includes(hint);
     // a tooltip showing ANOTHER patient's name is never accepted
-    const belongs = t => !hint || own(t) || !namePattern.test(clean(t));
+    // an empty slot's tooltip: "<Type> <time>" then a line with only a number
+    const emptySlot = t => /^\s*\d+\s*$/.test((t || '').split('\n')[1] || '');
+    const belongs = t => !hint || own(t) || (!namePattern.test(clean(t)) && !emptySlot(t));
     // 1) Tooltip that belongs to this appointment block
     for (let p = el; p && p !== document.body; p = p.parentElement) {
         const tip = p.querySelector('.tooltiptext');
@@ -3218,6 +3278,7 @@ _HOVER_TOOLTIP_JS = r"""
         const sig = line + '@' + Math.round(tr.left) + ',' + Math.round(tr.top);
         const dist = Math.hypot((tr.left + tr.right) / 2 - cx, (tr.top + tr.bottom) / 2 - cy);
         let rank;
+        if (before.has(sig)) continue;                       // was showing before this hover
         if (own(text)) rank = 0;
         else if (!belongs(text)) continue;                    // another patient
         else if (!before.has(sig) && dist <= 450) rank = 1;   // new, next to it
@@ -3254,7 +3315,8 @@ def _exclusion_reason(title, appt_type, patient_line, tip_lines=None):
         return "blocked schedule"
     if patient_line.casefold() in ("closed", "close"):
         return "closed"
-    if patient_line and not re.search(r"[A-Za-z]", patient_line):
+    title_has_name = any(re.search(r"[A-Za-z].*,\s*[A-Za-z]", l) for l in title.split("\n"))
+    if patient_line and not re.search(r"[A-Za-z]", patient_line) and not title_has_name:
         return f"no patient ('{patient_line}')"
     if _NOTE_TITLE.search(first_title_line):
         return f"schedule note ('{first_title_line[:40]}')"
@@ -3279,9 +3341,14 @@ def _name_hint(title):
     such as 'Primary Authorization Expired' before the name is skipped."""
     for line in str(title or "").split("\n"):
         if "," in line:
-            hint = re.sub(r"[^A-Z]", "", line.split(",", 1)[0].upper())
-            if len(hint) >= 2:
-                return hint
+            last, rest = line.split(",", 1)
+            last = re.sub(r"[^A-Z]", "", last.upper())
+            if len(last) < 2:
+                continue
+            # first name = first word after the comma ("Covington, ehab" ->
+            # COVINGTONEHAB), so two Covingtons side by side are told apart
+            first = re.match(r"\s*([A-Za-z][A-Za-z'\-]*)", rest)
+            return last + (re.sub(r"[^A-Z]", "", first.group(1).upper()) if first else "")
     return ""
 
 
@@ -3298,7 +3365,43 @@ def _tip_belongs(text, hint):
                      if not re.search(r"last\s*change|edited\s*by|created\s*by", l, re.I))
     if hint in re.sub(r"[^A-Z]", "", text.upper()):
         return True
-    return not _OTHER_NAME.search(text)
+    return not _OTHER_NAME.search(text) and not _empty_slot_tooltip(text)
+
+
+_SECTION_START = re.compile(
+    r"^[A-Za-z][A-Za-z0-9 &/'()+.\-]*?\s+\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?\s*$",
+    re.IGNORECASE)
+
+
+def _tooltip_section(text, hint, nth=0):
+    """A tooltip may list several appointments of the same slot, e.g.
+         Follow-Up 5:00pm / Smith, John ... / OneOnOne 5:00pm / Doe, Jane ...
+    Every "<Type> <time>" line starts a new appointment. Returns
+    (lines of THIS patient's appointment, how):
+      'single'    - only one appointment in the tooltip
+      'matched'   - several; the one holding this patient's name
+      'ambiguous' - several and none (or more than one) holds the name"""
+    lines = [l.strip() for l in str(text or "").split("\n") if l.strip()]
+    starts = [i for i, l in enumerate(lines) if _SECTION_START.match(l)]
+    if len(starts) <= 1:
+        return lines, "single"
+    sections = [lines[s:e] for s, e in zip(starts, starts[1:] + [len(lines)])]
+    if hint:
+        own = [sec for sec in sections
+               if hint in re.sub(r"[^A-Z]", "", " ".join(sec).upper())]
+        if len(own) == 1:
+            return own[0], "matched"
+        if len(own) > 1:
+            # the same patient booked twice in this slot: the n-th block of
+            # that name takes the n-th appointment that names him/her
+            return own[min(nth, len(own) - 1)], "matched"
+    return [s[0] for s in sections], "ambiguous"
+
+
+def _empty_slot_tooltip(text):
+    """'Follow-Up 10:30am' / '1' / ... - the tooltip of a slot with no patient."""
+    lines = [l.strip() for l in str(text or "").split("\n") if l.strip()]
+    return len(lines) > 1 and bool(re.fullmatch(r"\d+", lines[1]))
 
 
 def _tip_is_own(text, hint):
@@ -3354,6 +3457,7 @@ def _hover_tooltip_line(driver, element, hint, timeout=6.0):
         before = driver.execute_script(_VISIBLE_TOOLTIPS_JS) or []
         deadline = time.monotonic() + wait_for
         last_hover = 0.0
+        fallback = None
         while time.monotonic() < deadline:
             if time.monotonic() - last_hover > 1.5:
                 ActionChains(driver).move_to_element(element).perform()
@@ -3361,8 +3465,17 @@ def _hover_tooltip_line(driver, element, hint, timeout=6.0):
             found = driver.execute_script(_HOVER_TOOLTIP_JS, element, hint, before) or {}
             line = (found.get("line") or "") if isinstance(found, dict) else ""
             if _usable_tooltip(line):
-                return line.strip(), found.get("text") or "", bool(found.get("own"))
+                result = (line.strip(), found.get("text") or "", bool(found.get("own")))
+                if result[2] or not hint:
+                    return result
+                # a tooltip WITHOUT this patient's name: keep it as a fallback,
+                # but give the patient's own tooltip 2 more seconds to appear
+                if fallback is None:
+                    fallback = result
+                    deadline = min(deadline, time.monotonic() + 2.0)
             time.sleep(0.25)
+        if fallback is not None:
+            return fallback
     return "", "", False
 
 
@@ -3392,6 +3505,7 @@ def _parse_tooltip_line(line):
 # 2b) One clinic + one day: select clinic, date, Day view, read appointments
 # ---------------------------------------------------------------------
 _DAY_VERIFIED = {}     # (clinic, date) -> True when types and counts were confirmed
+_EMPTY_STREAK = {}     # date -> how many reads in a row found the day empty
 
 
 def _verify_day(headers_seen, appointments):
@@ -3466,11 +3580,12 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
     wait.until(selected_clinic, "Selected clinic did not match the requested clinic")
     wait_for_page_stable(driver, timeout=WAIT_TIMEOUT)
 
+    slow = WebDriverWait(driver, DAY_LOAD_TIMEOUT, poll_frequency=0.5)
     navigate_schedule_to_date(driver, target_date)
-    wait.until(lambda d: _read_selected_calendar_date(d) == target_date,
-               f"Calendar did not move to {target_date}")
+    slow.until(lambda d: _read_selected_calendar_date(d) == target_date,
+               f"Calendar did not move to {target_date} within {DAY_LOAD_TIMEOUT:.0f}s")
     _select_day_view(driver, wait)
-    wait.until(lambda d: _read_selected_calendar_date(d) == target_date,
+    slow.until(lambda d: _read_selected_calendar_date(d) == target_date,
                "Calendar date changed after selecting Day view")
 
     last_label = None
@@ -3493,10 +3608,15 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
         if not result:
             last_label, stable_since = None, None
             return False
-        if result != last_label:
-            last_label, stable_since = result, time.monotonic()
+        # the headers AND the number of appointment blocks must stop changing
+        blocks = d.execute_script(
+            "return Array.from(document.querySelectorAll('div.title')).filter("
+            "t => t.getClientRects().length && !t.closest('.tooltiptext')).length;")
+        signature = (result, blocks)
+        if signature != last_label:
+            last_label, stable_since = signature, time.monotonic()
             return False
-        quiet = 8.0 if all(item["count"] == 0 for item in result) else 3.0
+        quiet = 15.0 if all(item["count"] == 0 for item in result) else 4.0
         return result if time.monotonic() - stable_since >= quiet else False
 
     headers_seen = {}
@@ -3534,6 +3654,17 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
                     warn(f"Tooltip not readable for '{appt['title'][:40]}' "
                          f"({appt['therapist']}) — counted as Unknown")
                 tip_lines = [part.strip() for part in line.split("\n")]
+                section, how = _tooltip_section(tip_text or line, hint, occurrence)
+                if how == "matched":
+                    tip_lines = section
+                    log.info(f"  ·  Tooltip lists {len(_tooltip_section(tip_text, '')[0])} "
+                             f"appointments in this slot - took this patient's: {section[0]}")
+                elif how == "ambiguous":
+                    warn(f"Tooltip lists several appointments ({' / '.join(section)}) and "
+                         f"none clearly belongs to '{appt['title'][:40]}' - counted as Unknown")
+                    tip_lines = ["Unknown"]
+                elif section:
+                    tip_lines = section
                 appt_type, hour24, hour_label = _parse_tooltip_line(tip_lines[0])
                 reason = _exclusion_reason(appt["title"], appt_type,
                                            tip_lines[1] if len(tip_lines) > 1 else "",
@@ -3569,7 +3700,7 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
 
     def read_everything():
         nonlocal last_label, stable_since
-        collect_headers(wait.until(loaded_pt_label))
+        collect_headers(slow.until(loaded_pt_label, "The day did not finish loading"))
         collect_appointments()
 
         # Columns that only render when scrolled into view
@@ -3594,7 +3725,7 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
                         driver.execute_script("arguments[0].scrollLeft = arguments[1];", pane, position)
                         last_label, stable_since = None, None
                         time.sleep(0.5)
-                        collect_headers(wait.until(loaded_pt_label))
+                        collect_headers(slow.until(loaded_pt_label, "The day did not finish loading"))
                         collect_appointments()
                         if position >= maximum:
                             break
@@ -3656,6 +3787,7 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
 # ---------------------------------------------------------------------
 def scrape_clinic_pt_counts(driver, wait, target_dates, records=None, stop_at=None):
     records = records if records is not None else []
+    skipped_days = {}          # date -> why it was not written this pass
 
     for clinic_name in [CLINIC_NAME]:
         if stop_at is not None and _now() >= stop_at:
@@ -3681,7 +3813,18 @@ def scrape_clinic_pt_counts(driver, wait, target_dates, records=None, stop_at=No
                         warn(f"{clinic_name} | {target_date}: types/counts could not be "
                              f"confirmed after 3 reads - this day is NOT written to the "
                              f"sheet this pass; its rows stay as they are")
+                        skipped_days[target_date] = "types/counts not confirmed"
                         break
+                    if not any(not a.get("Excluded") for a in appointments):
+                        _EMPTY_STREAK[target_date] = _EMPTY_STREAK.get(target_date, 0) + 1
+                        if _EMPTY_STREAK[target_date] < 2:
+                            warn(f"{clinic_name} | {target_date}: the day looks EMPTY - not "
+                                 f"written until the next pass finds it empty too (a slow "
+                                 f"page can look empty)")
+                            skipped_days[target_date] = "looked empty - waiting for a second empty read"
+                            break
+                    else:
+                        _EMPTY_STREAK.pop(target_date, None)
 
                     for appt in appointments:
                         appt = dict(appt)
@@ -3723,11 +3866,11 @@ def scrape_clinic_pt_counts(driver, wait, target_dates, records=None, stop_at=No
                         warn(f"Restoring Schedule and retrying {clinic_name} for {target_date}")
                         continue
                     records.append({**base, "Status": status})
-                    save_clinic_counts_excel(records)
-                    raise RuntimeError(
-                        f"Collection stopped at {clinic_name} for {target_date} after 3 attempts; "
-                        "partial results saved locally, Google Sheets publication skipped."
-                    ) from exc
+                    skipped_days[target_date] = status
+                    fail(f"{clinic_name} | {target_date}: not read after 3 attempts - "
+                         f"skipped this pass (its rows stay as they are), moving on "
+                         f"to the next day")
+                    break
 
             # Publish each completed day before collection moves to the next date.
             save_clinic_counts_excel(records)
@@ -3738,6 +3881,16 @@ def scrape_clinic_pt_counts(driver, wait, target_dates, records=None, stop_at=No
                      f"{type(exc).__name__}: {exc}")
 
     ok(f"Clinic hourly counts saved to: {CLINIC_COUNTS_OUTPUT_PATH}")
+    written = [d for d in target_dates if d not in skipped_days]
+    log.info(f"  -  Days written this pass: {', '.join(written) or 'none'}")
+    for day, why in skipped_days.items():
+        warn(f"Day NOT written this pass: {day} - {why}")
+    failed = [d for d, why in skipped_days.items() if why.startswith("Error")]
+    if len(failed) >= 2:
+        # several days could not be read at all: the browser session is
+        # probably broken - end the pass so the next one starts on a fresh
+        # Chrome + login (the days that worked are already written)
+        raise RuntimeError(f"{len(failed)} day(s) could not be read: {', '.join(failed)}")
     return records
 
 
@@ -3958,6 +4111,10 @@ WINDOW_START_HOUR = 14   # 2 PM
 WINDOW_END_HOUR   = 4    # 4 AM (next day)
 GAP_MIN_MINUTES   = 3    # wait after each pass: random between
 GAP_MAX_MINUTES   = 5    # 3 and 5 minutes
+# The MOST to wait for a clicked day to finish loading (slow pages). As soon
+# as the day has loaded, the script carries on - it never waits the full time.
+DAY_LOAD_TIMEOUT = float(os.environ.get(
+    "WEBPT_DAY_LOAD_TIMEOUT", _local_settings.get("WEBPT_DAY_LOAD_TIMEOUT", 120)))
 # Chrome is closed and reopened (fresh login) once it is this old - checked
 # only between passes, never while a clinic/day is being read.
 CHROME_RECYCLE_SECONDS = float(os.environ.get(
