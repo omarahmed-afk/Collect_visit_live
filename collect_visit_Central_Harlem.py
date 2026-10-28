@@ -3247,7 +3247,7 @@ _HOVER_TOOLTIP_JS = r"""
     // a tooltip showing ANOTHER patient's name is never accepted
     // an empty slot's tooltip: "<Type> <time>" then a line with only a number
     const emptySlot = t => /^\s*\d+\s*$/.test((t || '').split('\n')[1] || '');
-    const belongs = t => !hint || own(t) || (!namePattern.test(clean(t)) && !emptySlot(t));
+    const belongs = t => !hint || own(t) || !namePattern.test(clean(t));
     // 1) Tooltip that belongs to this appointment block
     for (let p = el; p && p !== document.body; p = p.parentElement) {
         const tip = p.querySelector('.tooltiptext');
@@ -3281,7 +3281,8 @@ _HOVER_TOOLTIP_JS = r"""
         if (before.has(sig)) continue;                       // was showing before this hover
         if (own(text)) rank = 0;
         else if (!belongs(text)) continue;                    // another patient
-        else if (!before.has(sig) && dist <= 450) rank = 1;   // new, next to it
+        else if (!before.has(sig) && dist <= 450)
+            rank = emptySlot(text) ? 2 : 1;   // new, next to it (2 = the group's tooltip)
         else continue;
         if (rank < bestRank || (rank === bestRank && dist < bestDist)) {
             bestRank = rank; bestDist = dist; best = {line, text, own: rank === 0};
@@ -3365,7 +3366,7 @@ def _tip_belongs(text, hint):
                      if not re.search(r"last\s*change|edited\s*by|created\s*by", l, re.I))
     if hint in re.sub(r"[^A-Z]", "", text.upper()):
         return True
-    return not _OTHER_NAME.search(text) and not _empty_slot_tooltip(text)
+    return not _OTHER_NAME.search(text)
 
 
 _SECTION_START = re.compile(
@@ -3382,7 +3383,8 @@ def _tooltip_section(text, hint, nth=0):
       'matched'   - several; the one holding this patient's name
       'ambiguous' - several and none (or more than one) holds the name"""
     lines = [l.strip() for l in str(text or "").split("\n") if l.strip()]
-    starts = [i for i, l in enumerate(lines) if _SECTION_START.match(l)]
+    starts = [i for i, l in enumerate(lines) if _SECTION_START.match(l)
+              and not re.search(r"\b(opens?|close[sd]?)\b", l, re.IGNORECASE)]
     if len(starts) <= 1:
         return lines, "single"
     sections = [lines[s:e] for s, e in zip(starts, starts[1:] + [len(lines)])]
@@ -3659,10 +3661,12 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
                     tip_lines = section
                     log.info(f"  ·  Tooltip lists {len(_tooltip_section(tip_text, '')[0])} "
                              f"appointments in this slot - took this patient's: {section[0]}")
-                elif how == "ambiguous":
+                elif how == "ambiguous" and hint:
                     warn(f"Tooltip lists several appointments ({' / '.join(section)}) and "
                          f"none clearly belongs to '{appt['title'][:40]}' - counted as Unknown")
                     tip_lines = ["Unknown"]
+                elif how == "ambiguous":
+                    tip_lines = [part.strip() for part in (tip_text or line).split("\n") if part.strip()]
                 elif section:
                     tip_lines = section
                 appt_type, hour24, hour_label = _parse_tooltip_line(tip_lines[0])
@@ -3752,7 +3756,19 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
             break
         for problem in problems:
             warn(f"[{clinic_name}] {target_date} (read {read_round}/3): {problem}")
-    _DAY_VERIFIED[(clinic_name, target_date)] = not problems
+    only_unreadable = bool(problems) and all("no readable type/time" in p for p in problems)
+    if only_unreadable:
+        # everything else checked out: write the day without the unreadable
+        # appointment(s) rather than dropping the whole day; this day's rows
+        # are not reused or deleted this pass (see _INCOMPLETE_SCOPES)
+        for a in appointments.values():
+            if not a.get("Excluded") and (a["Hour"] == "Unknown"
+                                          or a["Appointment Type"] in ("", "Unknown")):
+                a["Excluded"] = "tooltip not readable"
+                warn(f"[{clinic_name}] {target_date}: '{a['Patient'][:25]}' left out - its "
+                     f"tooltip could not be read in 3 reads; the rest of the day is written "
+                     f"and no row of this day is deleted this pass")
+    _DAY_VERIFIED[(clinic_name, target_date)] = (not problems) or only_unreadable
 
     wait.until(selected_clinic, "Clinic changed during collection")
     if _read_selected_calendar_date(driver) != target_date:
@@ -3815,7 +3831,9 @@ def scrape_clinic_pt_counts(driver, wait, target_dates, records=None, stop_at=No
                              f"sheet this pass; its rows stay as they are")
                         skipped_days[target_date] = "types/counts not confirmed"
                         break
-                    if not any(not a.get("Excluded") for a in appointments):
+                    if (not any(not a.get("Excluded") for a in appointments)
+                            and not any(a.get("Excluded") == "tooltip not readable"
+                                        for a in appointments)):
                         _EMPTY_STREAK[target_date] = _EMPTY_STREAK.get(target_date, 0) + 1
                         if _EMPTY_STREAK[target_date] < 2:
                             warn(f"{clinic_name} | {target_date}: the day looks EMPTY - not "
@@ -4156,10 +4174,51 @@ def _sleep_until(target, reason):
         time.sleep(min(remaining, 30))
 
 
+def purge_past_rows():
+    """Removes every row dated today or earlier (Cairo date) from this
+    clinic's tab. Runs at the start of every shift (2 PM)."""
+    today = _now().date().isoformat()
+    step(f"Removing rows dated {today} or earlier from the sheet")
+    with sheet_lock():
+        if USE_SHEET_LOCK and not _my_token["value"]:
+            warn("Sheet lock not owned - past rows are removed at the next shift start")
+            return
+        spreadsheet = _open_google_spreadsheet()
+        _, _, tab_name = _google_sheet_settings()
+        ws = next((t for t in _api(spreadsheet.worksheets)
+                   if t.title.casefold() == tab_name.casefold()), None)
+        if ws is None:
+            return
+        values = _api(ws.get_all_values) or []
+        old = []
+        for n, r in enumerate(values[1:], start=2):
+            d = normalize_key_part(r[1]) if len(r) > 1 else ""
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and d <= today:
+                old.append(n)
+        if not old:
+            ok(f"No rows dated {today} or earlier in '{tab_name}'")
+            return
+        ranges = []                       # contiguous blocks, bottom first
+        for n in sorted(old, reverse=True):
+            if ranges and ranges[-1][0] == n + 1:
+                ranges[-1][0] = n
+            else:
+                ranges.append([n, n])
+        requests = [{"deleteDimension": {"range": {
+            "sheetId": ws.id, "dimension": "ROWS",
+            "startIndex": a - 1, "endIndex": b}}} for a, b in ranges]
+        _api(ws.spreadsheet.batch_update, {"requests": requests})
+        ok(f"Removed {len(old)} row(s) dated {today} or earlier from '{tab_name}'")
+
+
 def run_live_shift():
     """Runs one shift: browser stays open, passes repeat until 4 AM."""
     shift_end = _window_end(_now())
     step(f"SHIFT STARTED | LIVE until {shift_end:%Y-%m-%d %I:%M %p} (Cairo)")
+    try:
+        purge_past_rows()
+    except Exception as exc:
+        fail(f"Could not remove past rows from the sheet: {type(exc).__name__}: {exc}")
     driver = wait = None
     driver_started_at = None
     pass_number = 0
