@@ -3394,7 +3394,10 @@ def _name_hint(title):
     for line in str(title or "").split("\n"):
         if "," in line:
             last, rest = line.split(",", 1)
-            last = re.sub(r"[^A-Z]", "", last.upper())
+            # "POC Gay, Bertha" -> GAY: badges (POC, PN, ...) in front of the
+            # name are dropped; "De La Cruz" -> CRUZ still matches the tooltip
+            words = re.findall(r"[A-Za-z'\-]+", last)
+            last = re.sub(r"[^A-Z]", "", words[-1].upper()) if words else ""
             if len(last) < 2:
                 continue
             # first name = first word after the comma ("Covington, ehab" ->
@@ -3455,6 +3458,21 @@ def _empty_slot_tooltip(text):
     """'Follow-Up 10:30am' / '1' / ... - the tooltip of a slot with no patient."""
     lines = [l.strip() for l in str(text or "").split("\n") if l.strip()]
     return len(lines) > 1 and bool(re.fullmatch(r"\d+", lines[1]))
+
+
+_BADGES = re.compile(r"\bPOC\b[\s:\-]*", re.IGNORECASE)
+
+
+def _strip_badges(text):
+    """Removes the POC badge from a block's text or a tooltip:
+    'POC Gay, Bertha' -> 'Gay, Bertha', 'POC Expiring Plan of Care' ->
+    'Expiring Plan of Care'; a line that was only 'POC' disappears."""
+    lines = []
+    for line in str(text or "").split("\n"):
+        line = re.sub(r"\s{2,}", " ", _BADGES.sub("", line)).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def _tip_is_own(text, hint):
@@ -3719,12 +3737,15 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
                 key = base_key + (occurrence,)
                 if key in appointments:
                     continue
+                appt["title"] = _strip_badges(appt["title"])     # POC is ignored
+                appt["tip"] = _strip_badges(appt["tip"])
+                appt["tipText"] = _strip_badges(appt.get("tipText"))
                 hint = _name_hint(appt["title"])
                 tip_text = appt.get("tipText") or ""
                 line = appt["tip"] if (_usable_tooltip(appt["tip"])
                                        and _tip_belongs(tip_text, hint)) else ""
-                is_note = (not hint and bool(_NOTE_TITLE.search(
-                    appt["title"].split("\n")[0].strip())))
+                is_note = (not hint and (not appt["title"].strip() or bool(_NOTE_TITLE.search(
+                    appt["title"].split("\n")[0].strip()))))
                 if not line and not is_note:
                     try:
                         line, tip_text, _ = _hover_tooltip_line(driver, appt["el"], hint)
@@ -3734,6 +3755,7 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
                 if not line and not is_note:
                     warn(f"Tooltip not readable for '{appt['title'][:40]}' "
                          f"({appt['therapist']}) — counted as Unknown")
+                line, tip_text = _strip_badges(line), _strip_badges(tip_text)
                 tip_lines = [part.strip() for part in line.split("\n")]
                 section, how = _tooltip_section(tip_text or line, hint, occurrence)
                 if how == "matched":
