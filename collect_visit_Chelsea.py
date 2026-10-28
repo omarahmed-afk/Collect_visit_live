@@ -444,7 +444,42 @@ def sync_visit_rows(ws, rows, headers):
     elif appends:
         log.warning(f"{len(appends)} new row(s) not added because an earlier step failed "
                     f"- they are sent again at the next publish")
+    if ok_so_far:
+        try:
+            _sort_tab_if_needed(ws, current)
+        except Exception as e:
+            log.error(f"Sorting the tab failed: {e}")
     return ok_so_far
+
+
+def _sheet_value(v):
+    """'3' -> 3 so a rewritten Count stays a number."""
+    if isinstance(v, str) and re.fullmatch(r"-?\d+", v.strip()):
+        return int(v.strip())
+    return v
+
+
+def _sort_tab_if_needed(ws, current):
+    """`current` = the tab as it is now (header first). If its rows are not
+    in date / time / clinic / type order, rewrites them in that order.
+    Rows that cannot be read as a visit stay at the bottom."""
+    data = current[1:]
+    keyed = [(_visit_sort_key(r), i, r) for i, r in enumerate(data)]
+    good = [x for x in keyed if x[0] is not None]
+    bad = [x for x in keyed if x[0] is None]
+    in_order = (all(good[i][0] <= good[i + 1][0] for i in range(len(good) - 1))
+                and all(x[1] > good[-1][1] for x in bad) if good else True)
+    if in_order or not data:
+        return
+    wanted = [r for _, _, r in sorted(good, key=lambda x: (x[0], x[1]))] + [r for _, _, r in bad]
+    values = [[_sheet_value(v) for v in (list(r[:5]) + [""] * (5 - len(r[:5])))] for r in wanted]
+    body = [{"range": f"A2:E{len(values) + 1}", "values": values}]
+    try:
+        _api(ws.batch_update, body, value_input_option="RAW")
+    except TypeError:
+        _api(ws.batch_update, body)
+    current[1:] = wanted
+    log.info(f"Tab re-sorted by date and time ({len(values)} row(s))")
 
 
 def _visit_sort_key(r):
@@ -3224,7 +3259,7 @@ _READ_APPOINTMENTS_JS = r"""
 """
 
 _HOVER_TOOLTIP_JS = r"""
-    const el = arguments[0], hint = arguments[1];
+    const el = arguments[0], hint = arguments[1], relaxed = arguments[3] === true;
     const norm = s => (s || '').toUpperCase().replace(/[^A-Z]/g, '');
     const firstLine = tip => {
         let lines = Array.from(tip.querySelectorAll('div'))
@@ -3253,7 +3288,8 @@ _HOVER_TOOLTIP_JS = r"""
         const tip = p.querySelector('.tooltiptext');
         if (tip) {
             const line = firstLine(tip), text = fullText(tip);
-            if (line && belongs(text)) return {line, text, own: own(text)};
+            if (line && !/loading/i.test(line) && belongs(text))
+                return {line, text, own: own(text)};
             break;
         }
         if (!p.parentElement ||
@@ -3263,25 +3299,40 @@ _HOVER_TOOLTIP_JS = r"""
     //    or one that just appeared after hovering, close to the block, and
     //    showing no other patient (some tooltips show "Progress Note Needed"
     //    instead of the patient name).
+
+    const TIP_SELECTOR = '.tooltiptext, .x-tip, .tooltip, .qtip, [role="tooltip"]';
+    const typeTime = /^[A-Za-z][^\n]*?\d{1,2}:\d{2}\s*(a\.?m\.?|p\.?m\.?)?/i;
+    const tipCandidates = () => {
+        const out = [];
+        for (const t of document.querySelectorAll(TIP_SELECTOR))
+            if (!out.some(o => o.contains(t))) out.push(t);    // outermost only
+        return out;
+    };
+    const genericLines = t => (t.innerText || t.textContent || '')
+        .split(/\r?\n/).map(s => s.trim()).filter(Boolean);
     const before = new Set(arguments[2] || []);
     const r = el.getBoundingClientRect();
     const cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
     let best = null, bestRank = Infinity, bestDist = Infinity;
-    for (const tip of document.querySelectorAll('.tooltiptext')) {
+    for (const tip of tipCandidates()) {
         const tr = tip.getBoundingClientRect();
         if (tr.width < 10 || tr.height < 5) continue;
         const st = getComputedStyle(tip);
         if (st.display === 'none' || st.visibility === 'hidden' ||
             parseFloat(st.opacity || '1') < 0.1) continue;
-        const line = firstLine(tip), text = fullText(tip);
-        if (!line) continue;
+        const generic = !tip.classList.contains('tooltiptext');
+        const gl = generic ? genericLines(tip) : null;
+        if (generic && !typeTime.test(gl[0] || '')) continue;   // not an appointment tooltip
+        const line = generic ? gl.slice(0, 4).join('\n') : firstLine(tip);
+        const text = generic ? gl.join('\n') : fullText(tip);
+        if (!line || /loading/i.test(line)) continue;
         const sig = line + '@' + Math.round(tr.left) + ',' + Math.round(tr.top);
         const dist = Math.hypot((tr.left + tr.right) / 2 - cx, (tr.top + tr.bottom) / 2 - cy);
         let rank;
         if (before.has(sig)) continue;                       // was showing before this hover
         if (own(text)) rank = 0;
         else if (!belongs(text)) continue;                    // another patient
-        else if (!before.has(sig) && dist <= 450)
+        else if (!before.has(sig) && (relaxed || dist <= 450))
             rank = emptySlot(text) ? 2 : 1;   // new, next to it (2 = the group's tooltip)
         else continue;
         if (rank < bestRank || (rank === bestRank && dist < bestDist)) {
@@ -3412,6 +3463,17 @@ def _tip_is_own(text, hint):
 
 _VISIBLE_TOOLTIPS_JS = r"""
     const out = [];
+    const TIP_SELECTOR = '.tooltiptext, .x-tip, .tooltip, .qtip, [role="tooltip"]';
+    const typeTime = /^[A-Za-z][^\n]*?\d{1,2}:\d{2}\s*(a\.?m\.?|p\.?m\.?)?/i;
+    const tipCandidates = () => {
+        const found = [];
+        for (const t of document.querySelectorAll(TIP_SELECTOR))
+            if (!found.some(o => o.contains(t))) found.push(t);    // outermost only
+        return found;
+    };
+    const genericLines = t => (t.innerText || t.textContent || '')
+        .split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
     const firstLine = tip => {
         let lines = Array.from(tip.querySelectorAll('div'))
             .filter(d => !d.querySelector('div'))
@@ -3420,13 +3482,14 @@ _VISIBLE_TOOLTIPS_JS = r"""
             lines = (tip.textContent || '').trim().split(/\r?\n/).map(s => s.trim());
         return lines.filter(Boolean).slice(0, 4).join('\n');
     };
-    for (const tip of document.querySelectorAll('.tooltiptext')) {
+    for (const tip of tipCandidates()) {
         const tr = tip.getBoundingClientRect();
         if (tr.width < 10 || tr.height < 5) continue;
         const st = getComputedStyle(tip);
         if (st.display === 'none' || st.visibility === 'hidden' ||
             parseFloat(st.opacity || '1') < 0.1) continue;
-        const line = firstLine(tip);
+        const generic = !tip.classList.contains('tooltiptext');
+        const line = generic ? genericLines(tip).slice(0, 4).join('\n') : firstLine(tip);
         if (line) out.push(line + '@' + Math.round(tr.left) + ',' + Math.round(tr.top));
     }
     return out;
@@ -3451,7 +3514,9 @@ def _hover_tooltip_line(driver, element, hint, timeout=6.0):
     Tries twice; the second time it first moves the mouse away so the
     old tooltip closes. Returns (line, full_text, shows_this_patient)."""
     from selenium.webdriver.common.action_chains import ActionChains
-    for round_number, wait_for in ((1, timeout), (2, timeout + 4)):
+    # round 3 = relaxed: any tooltip that opened after the hover, at any
+    # distance, as long as it shows no other patient
+    for round_number, wait_for in ((1, timeout), (2, timeout + 4), (3, 5.0)):
         if round_number == 2:
             _move_mouse_away(driver)
         driver.execute_script(
@@ -3464,7 +3529,8 @@ def _hover_tooltip_line(driver, element, hint, timeout=6.0):
             if time.monotonic() - last_hover > 1.5:
                 ActionChains(driver).move_to_element(element).perform()
                 last_hover = time.monotonic()
-            found = driver.execute_script(_HOVER_TOOLTIP_JS, element, hint, before) or {}
+            found = driver.execute_script(_HOVER_TOOLTIP_JS, element, hint, before,
+                                          round_number == 3) or {}
             line = (found.get("line") or "") if isinstance(found, dict) else ""
             if _usable_tooltip(line):
                 result = (line.strip(), found.get("text") or "", bool(found.get("own")))
@@ -3477,7 +3543,18 @@ def _hover_tooltip_line(driver, element, hint, timeout=6.0):
                     deadline = min(deadline, time.monotonic() + 2.0)
             time.sleep(0.25)
         if fallback is not None:
+            if round_number == 3:
+                log.info("  ·  Tooltip taken in the relaxed 3rd round (opened away from the block)")
             return fallback
+    try:
+        r = driver.execute_script(
+            "var r=arguments[0].getBoundingClientRect();return [Math.round(r.left),Math.round(r.top)];",
+            element)
+        shown = [s.split("\n")[0] + " @" + s.rsplit("@", 1)[-1]
+                 for s in (driver.execute_script(_VISIBLE_TOOLTIPS_JS) or [])]
+        log.info(f"  ·  No usable tooltip - block at {r}; tooltips on screen: {shown or 'none'}")
+    except Exception:
+        pass
     return "", "", False
 
 
@@ -3646,13 +3723,15 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
                 tip_text = appt.get("tipText") or ""
                 line = appt["tip"] if (_usable_tooltip(appt["tip"])
                                        and _tip_belongs(tip_text, hint)) else ""
-                if not line:
+                is_note = (not hint and bool(_NOTE_TITLE.search(
+                    appt["title"].split("\n")[0].strip())))
+                if not line and not is_note:
                     try:
                         line, tip_text, _ = _hover_tooltip_line(driver, appt["el"], hint)
                     except StaleElementReferenceException:
                         pending += 1
                         continue
-                if not line:
+                if not line and not is_note:
                     warn(f"Tooltip not readable for '{appt['title'][:40]}' "
                          f"({appt['therapist']}) — counted as Unknown")
                 tip_lines = [part.strip() for part in line.split("\n")]
@@ -3831,13 +3910,13 @@ def scrape_clinic_pt_counts(driver, wait, target_dates, records=None, stop_at=No
                              f"sheet this pass; its rows stay as they are")
                         skipped_days[target_date] = "types/counts not confirmed"
                         break
-                    if (not any(not a.get("Excluded") for a in appointments)
-                            and not any(a.get("Excluded") == "tooltip not readable"
-                                        for a in appointments)):
+                    # nothing at all on the page = maybe not loaded yet; notes,
+                    # CLOSED or empty slots on it = it has loaded
+                    if not appointments:
                         _EMPTY_STREAK[target_date] = _EMPTY_STREAK.get(target_date, 0) + 1
                         if _EMPTY_STREAK[target_date] < 2:
-                            warn(f"{clinic_name} | {target_date}: the day looks EMPTY - not "
-                                 f"written until the next pass finds it empty too (a slow "
+                            warn(f"{clinic_name} | {target_date}: nothing at all on the page - "
+                                 f"not written until the next pass finds it empty too (a slow "
                                  f"page can look empty)")
                             skipped_days[target_date] = "looked empty - waiting for a second empty read"
                             break
@@ -3850,9 +3929,11 @@ def scrape_clinic_pt_counts(driver, wait, target_dates, records=None, stop_at=No
                         records.append({**base, **appt,
                                         "Status": f"EXCLUDED: {reason}" if reason else "OK"})
                     excluded_count = sum(1 for a in appointments if a.get("Excluded"))
+                    unreadable = any(a.get("Excluded") == "tooltip not readable"
+                                     for a in appointments)
                     appointments = [a for a in appointments if not a.get("Excluded")]
                     for variant in (clinic_name, f"{clinic_name} {OT_SUFFIX}"):
-                        if (variant == clinic_name or CLINIC_HAS_OT) and not any(
+                        if (variant == clinic_name or CLINIC_HAS_OT) and not unreadable and not any(
                                 a["Clinic"] == variant for a in appointments):
                             records.append({**base, "Clinic": variant, "Status": "EMPTY"})
 
