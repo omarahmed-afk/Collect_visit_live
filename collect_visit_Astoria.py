@@ -64,6 +64,47 @@ _TRANSIENT = ("429", "quota", "rate limit", "ratelimitexceeded",
 
 
 _my_token = {"value": None}     # set while THIS process holds the lock
+_quota_mode = {"fail_fast": False}  # True while a locked sheet write is running
+
+
+class _QuotaHit(Exception):
+    """Google's per-minute quota was hit while holding the sheet lock."""
+
+
+def _locked_sheet_write(work, what, attempts=10):
+    """Runs work() while holding the sheet lock. If Google answers 429 the
+    lock is released at once (the other 31 scripts are not kept waiting),
+    the script waits for the quota minute to roll over, then takes the lock
+    again and runs work() from the start - it re-reads the sheet, so a write
+    that was half done is simply finished. Returns work()'s result, or None
+    if the quota never cleared (the rows are sent again at the next write).
+    If the lock could not be taken in time, the write is not skipped: it is
+    tried again a few seconds later."""
+    for attempt in range(1, attempts + 1):
+        with sheet_lock():
+            busy = USE_SHEET_LOCK and not _my_token["value"]
+            if not busy:
+                _quota_mode["fail_fast"] = True
+                try:
+                    return work()
+                except _QuotaHit:
+                    pass
+                finally:
+                    _quota_mode["fail_fast"] = False
+        if busy:
+            # another script held the lock for the whole wait: do not skip
+            # the write, try again shortly
+            pause = random.uniform(5, 20)
+            log.warning(f"Sheet lock still busy for {what} - trying again in {pause:.0f}s "
+                        f"(attempt {attempt}/{attempts})")
+        else:
+            pause = min(70, 10 * attempt) + random.uniform(0, 15)
+            log.warning(f"Google read/write limit hit during {what} - lock released, "
+                        f"retrying in {pause:.0f}s (attempt {attempt}/{attempts})")
+        time.sleep(pause)
+    log.warning(f"Google limit still hit after {attempts} tries - {what} is sent "
+                f"again at the next write")
+    return None
 
 
 
@@ -183,6 +224,8 @@ def _api(fn, *args, **kwargs):
             # over (10, 20, ... 70 s + random) and try up to 10 times
             quota = any(k in msg for k in ("429", "quota", "rate limit", "ratelimitexceeded"))
             limit = max(attempts, 10) if quota else attempts
+            if quota and _quota_mode["fail_fast"]:
+                raise _QuotaHit(msg[:200])    # caller releases the lock, then waits
             if not transient or attempt >= limit:
                 raise
             if quota:
@@ -3338,7 +3381,8 @@ _HOVER_TOOLTIP_JS = r"""
         const sig = line + '@' + Math.round(tr.left) + ',' + Math.round(tr.top);
         const dist = Math.hypot((tr.left + tr.right) / 2 - cx, (tr.top + tr.bottom) / 2 - cy);
         let rank;
-        if (before.has(sig)) continue;                       // was showing before this hover
+        if (before.has(sig) && !own(text)) continue;         // open before the hover = the
+                                                             // neighbour's, unless it names this patient
         if (own(text)) rank = 0;
         else if (!belongs(text)) continue;                    // another patient
         else if (!before.has(sig) && (relaxed || dist <= 450))
@@ -4149,14 +4193,18 @@ def publish_google_sheet():
     # Deduplicate incoming keys before the supplied guard sees the batch.
     key_fn = lambda r: tuple(normalize_key_part(x) for x in r[:4]) if len(r) >= 4 and r[0] != "Clinic" else None
     rows = list({key_fn(row): row for row in rows}.values())
-    # read fresh + rewrite / append / delete, all under one lock
-    with sheet_lock():
+    # read fresh + rewrite / append / delete, all under one lock; on a 429
+    # the lock is released while waiting (see _locked_sheet_write)
+    def work():
         try:
             ws = _clinic_ws(len(rows))
-            sync_visit_rows(ws, rows, SHEET_COLUMNS)
+            return sync_visit_rows(ws, rows, SHEET_COLUMNS)
+        except _QuotaHit:
+            raise
         except Exception:
             _sheet_cache.clear()          # re-open next time (tab renamed, ...)
             raise
+    _locked_sheet_write(work, "the sheet update")
 
 
 def _norm_sheet_date(value):
@@ -4317,7 +4365,7 @@ def purge_past_rows():
     clinic's tab. Runs at the start of every shift (2 PM)."""
     today = _now().date().isoformat()
     step(f"Removing rows dated {today} or earlier from the sheet")
-    with sheet_lock():
+    def work():
         if USE_SHEET_LOCK and not _my_token["value"]:
             warn("Sheet lock not owned - past rows are removed at the next shift start")
             return
@@ -4344,6 +4392,7 @@ def purge_past_rows():
         _api(ws.spreadsheet.batch_update, {"requests": requests})
         ok(f"Removed {len(old)} row(s) dated {today} or earlier from '{tab_name}'")
 
+    _locked_sheet_write(work, "removing past rows")
 
 def run_live_shift():
     """Runs one shift: browser stays open, passes repeat until 4 AM."""
