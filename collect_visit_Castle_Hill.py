@@ -171,15 +171,24 @@ def _api(fn, *args, **kwargs):
     returns 429. Retrying after a growing pause turns a lost write into a
     slow one."""
     attempts = kwargs.pop("_attempts", API_ATTEMPTS)
-    for attempt in range(1, attempts + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             return fn(*args, **kwargs)
         except Exception as e:
             msg = str(e).lower()
             transient = any(k in msg for k in _TRANSIENT)
-            if not transient or attempt == attempts:
+            # the per-minute quota: wait long enough for the minute to roll
+            # over (10, 20, ... 70 s + random) and try up to 10 times
+            quota = any(k in msg for k in ("429", "quota", "rate limit", "ratelimitexceeded"))
+            limit = max(attempts, 10) if quota else attempts
+            if not transient or attempt >= limit:
                 raise
-            pause = min(60, (2 ** attempt) + random.uniform(0, 1.5))
+            if quota:
+                pause = min(70, 10 * attempt) + random.uniform(0, 15)
+            else:
+                pause = min(60, (2 ** attempt) + random.uniform(0, 1.5))
             log.warning(f"Google API busy ({type(e).__name__}) - retrying in "
                         f"{pause:.1f}s (attempt {attempt}/{attempts})")
             time.sleep(pause)
@@ -4054,6 +4063,26 @@ def _gs_client():
     return _gsheet_client
 
 
+_sheet_cache = {}       # the opened spreadsheet and this clinic's tab, reused
+
+
+def _clinic_ws(min_rows=100):
+    """This clinic's tab, looked up once and reused (saves 2 reads per write).
+    Created if it does not exist."""
+    _, _, tab_name = _google_sheet_settings()
+    ws = _sheet_cache.get(("ws", tab_name))
+    if ws is not None:
+        return ws
+    spreadsheet = _open_google_spreadsheet()
+    ws = next((t for t in _api(spreadsheet.worksheets)
+               if t.title.casefold() == tab_name.casefold()), None)
+    if ws is None:
+        ws = _api(spreadsheet.add_worksheet, title=tab_name,
+                  rows=max(100, min_rows + 1), cols=5)
+    _sheet_cache[("ws", tab_name)] = ws
+    return ws
+
+
 def _open_google_spreadsheet():
     """Opens the spreadsheet, raising a clear error for each common problem."""
     global _gsheet_client
@@ -4076,8 +4105,12 @@ def _open_google_spreadsheet():
             _gsheet_client = gspread.service_account_from_dict(secret_credentials, scopes=scopes)
         else:
             _gsheet_client = gspread.service_account(filename=str(credentials_path), scopes=scopes)
+    if _sheet_cache.get("url") == sheet_url and _sheet_cache.get("sh") is not None:
+        return _sheet_cache["sh"]
     try:
-        return _api(_gsheet_client.open_by_url, sheet_url)
+        _sheet_cache["sh"] = _api(_gsheet_client.open_by_url, sheet_url)
+        _sheet_cache["url"] = sheet_url
+        return _sheet_cache["sh"]
     except gspread.exceptions.SpreadsheetNotFound:
         email = (secret_credentials if secret_credentials is not None else
                  json.loads(credentials_path.read_text(encoding="utf-8"))).get("client_email", "?")
@@ -4116,16 +4149,14 @@ def publish_google_sheet():
     # Deduplicate incoming keys before the supplied guard sees the batch.
     key_fn = lambda r: tuple(normalize_key_part(x) for x in r[:4]) if len(r) >= 4 and r[0] != "Clinic" else None
     rows = list({key_fn(row): row for row in rows}.values())
-    with sheet_lock():
-        spreadsheet = _open_google_spreadsheet()
-        _, _, tab_name = _google_sheet_settings()
-        worksheets = _api(spreadsheet.worksheets)
-        ws = next((tab for tab in worksheets if tab.title.casefold() == tab_name.casefold()), None)
-        if ws is None:
-            ws = _api(spreadsheet.add_worksheet, title=tab_name, rows=max(100, len(rows) + 1), cols=5)
     # read fresh + rewrite / append / delete, all under one lock
     with sheet_lock():
-        sync_visit_rows(ws, rows, SHEET_COLUMNS)
+        try:
+            ws = _clinic_ws(len(rows))
+            sync_visit_rows(ws, rows, SHEET_COLUMNS)
+        except Exception:
+            _sheet_cache.clear()          # re-open next time (tab renamed, ...)
+            raise
 
 
 def _norm_sheet_date(value):
@@ -4158,7 +4189,9 @@ def _target_dates(now):
 
 
 def _remove_today_from_saved_counts():
-    """Remove today's local rows, then publish under the existing sheet lock."""
+    """Removes today's rows from the local file. (It no longer republishes the
+    previous pass to the sheet - every day is published as soon as it is
+    read, and that extra publish only used up the read quota.)"""
     path = Path(CLINIC_COUNTS_OUTPUT_PATH)
     if not path.exists():
         save_clinic_counts_excel([])
@@ -4174,7 +4207,6 @@ def _remove_today_from_saved_counts():
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             for name, frame in sheets.items():
                 frame.to_excel(writer, sheet_name=name, index=False)
-    publish_google_sheet()
 
 
 def _open_live_session():
@@ -4206,7 +4238,10 @@ def _close_live_session(driver):
 def collect_pass(driver, wait, pass_number, stop_at):
     """One full reading pass over all clinics, in the already-open browser."""
     target_dates = _target_dates(_now())
-    _remove_today_from_saved_counts()
+    try:
+        _remove_today_from_saved_counts()
+    except Exception as exc:
+        warn(f"Could not tidy the local file: {type(exc).__name__}: {exc}")
     if not target_dates:
         ok("No remaining dates this week after today")
         return
@@ -4286,12 +4321,8 @@ def purge_past_rows():
         if USE_SHEET_LOCK and not _my_token["value"]:
             warn("Sheet lock not owned - past rows are removed at the next shift start")
             return
-        spreadsheet = _open_google_spreadsheet()
         _, _, tab_name = _google_sheet_settings()
-        ws = next((t for t in _api(spreadsheet.worksheets)
-                   if t.title.casefold() == tab_name.casefold()), None)
-        if ws is None:
-            return
+        ws = _clinic_ws()
         values = _api(ws.get_all_values) or []
         old = []
         for n, r in enumerate(values[1:], start=2):
@@ -4421,9 +4452,18 @@ def _handle_sigterm(signum, frame):
     raise SystemExit(0)      # runs the finally blocks: Chrome quits, lock released
 
 
+STARTUP_JITTER_SECONDS = float(os.environ.get(
+    "WEBPT_STARTUP_JITTER_SECONDS", _local_settings.get("WEBPT_STARTUP_JITTER_SECONDS", 120)))
+
+
 def main():
     signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
+        if STARTUP_JITTER_SECONDS > 0:
+            pause = random.uniform(0, STARTUP_JITTER_SECONDS)
+            log.info(f"Waiting {pause:.0f}s before the first sheet access "
+                     f"(so 32 scripts started together do not hit the sheet at once)")
+            time.sleep(pause)
         run_scheduler()
     except KeyboardInterrupt:
         log.info("Scheduler stopped")
