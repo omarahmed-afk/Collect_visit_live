@@ -3404,7 +3404,7 @@ _NAME_WITH_DOB = re.compile(r"[A-Za-z].*,\s*[A-Za-z].*\b\d{1,2}/\d{1,2}/\d{2,4}\
 _CALENDAR_MARKER = re.compile(r"^\W*calendar\s*(start|end)\b", re.IGNORECASE)
 
 
-def _exclusion_reason(title, appt_type, patient_line, tip_lines=None):
+def _exclusion_reason(title, appt_type, patient_line, tip_lines=None, has_poc=False):
     """Returns why an entry is NOT a real patient appointment ('' = count it).
        - blocked schedule entries        ('blocked schedule 9:00am' / 'Closed')
        - slots with no patient           ('Follow-Up 11:30am' / '1')
@@ -3425,13 +3425,12 @@ def _exclusion_reason(title, appt_type, patient_line, tip_lines=None):
         return f"no patient ('{patient_line}')"
     if _NOTE_TITLE.search(first_title_line):
         return f"schedule note ('{first_title_line[:40]}')"
-    # Real appointments show the patient as "LAST, FIRST". A warning such as
-    # "Primary Authorization Expired" can come first, so any line holding
-    # "LAST, FIRST - MM/DD/YYYY" (title or tooltip) also counts.
+    # POC / authorization warnings may precede the patient name. The name
+    # can be on any title or tooltip line, with or without a date of birth.
     other_lines = [l for l in title.split("\n")[1:] + list(tip_lines or [])[1:]
                    if not re.search(r"last\s*change|edited\s*by|created\s*by", str(l), re.IGNORECASE)]
-    if not (re.search(r"[A-Za-z].*,\s*[A-Za-z]", first_title_line)
-            or any(_NAME_WITH_DOB.search(str(l)) for l in other_lines)):
+    if not (has_poc or re.search(r"[A-Za-z].*,\s*[A-Za-z]", first_title_line)
+            or any(re.search(r"[A-Za-z].*,\s*[A-Za-z]", str(l)) for l in other_lines)):
         return f"no patient name ('{first_title_line[:40]}')"
     return ""
 
@@ -3513,7 +3512,8 @@ def _empty_slot_tooltip(text):
     return len(lines) > 1 and bool(re.fullmatch(r"\d+", lines[1]))
 
 
-_BADGES = re.compile(r"\bPOC\b[\s:\-]*", re.IGNORECASE)
+_BADGES = re.compile(
+    r"\bPOC\b[\s:\-]*|\b(?-i:POC(?=[A-Z][a-z]))", re.IGNORECASE)
 
 
 def _strip_badges(text):
@@ -3790,7 +3790,9 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
                 key = base_key + (occurrence,)
                 if key in appointments:
                     continue
-                appt["title"] = _strip_badges(appt["title"])     # POC is ignored
+                has_poc = any(_BADGES.search(str(appt.get(field) or ""))
+                              for field in ("title", "tip", "tipText"))
+                appt["title"] = _strip_badges(appt["title"])     # retain badge separately for counting
                 appt["tip"] = _strip_badges(appt["tip"])
                 appt["tipText"] = _strip_badges(appt.get("tipText"))
                 hint = _name_hint(appt["title"])
@@ -3808,6 +3810,8 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
                 if not line and not is_note:
                     warn(f"Tooltip not readable for '{appt['title'][:40]}' "
                          f"({appt['therapist']}) — counted as Unknown")
+                has_poc = has_poc or bool(_BADGES.search(line or "")
+                                          or _BADGES.search(tip_text or ""))
                 line, tip_text = _strip_badges(line), _strip_badges(tip_text)
                 tip_lines = [part.strip() for part in line.split("\n")]
                 section, how = _tooltip_section(tip_text or line, hint, occurrence)
@@ -3826,7 +3830,7 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
                 appt_type, hour24, hour_label = _parse_tooltip_line(tip_lines[0])
                 reason = _exclusion_reason(appt["title"], appt_type,
                                            tip_lines[1] if len(tip_lines) > 1 else "",
-                                           tip_lines)
+                                           tip_lines, has_poc=has_poc)
                 if reason:
                     log.info(f"  ·  Not counted: {reason} | {' / '.join(tip_lines)}")
                 column = appt.get("column")
@@ -3893,23 +3897,10 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
             except StaleElementReferenceException:
                 raise RuntimeError("Schedule pane was replaced while scrolling; retrying")
 
-    problems = []
-    for read_round in range(1, 4):
-        if read_round > 1:
-            headers_seen.clear()
-            appointments.clear()
-            last_label, stable_since = None, None
-            _move_mouse_away(driver)
-            warn(f"[{clinic_name}] {target_date}: re-reading every appointment "
-                 f"(read {read_round}/3)")
-        read_everything()
-        problems = _verify_day(headers_seen, appointments)
-        if not problems:
-            if read_round > 1:
-                ok(f"[{clinic_name}] {target_date}: types and counts confirmed on read {read_round}")
-            break
-        for problem in problems:
-            warn(f"[{clinic_name}] {target_date} (read {read_round}/3): {problem}")
+    read_everything()
+    problems = _verify_day(headers_seen, appointments)
+    for problem in problems:
+        warn(f"[{clinic_name}] {target_date}: {problem}")
     only_unreadable = bool(problems) and all("no readable type/time" in p for p in problems)
     if only_unreadable:
         # everything else checked out: write the day without the unreadable
@@ -3920,7 +3911,7 @@ def _collect_clinic_day(driver, wait, clinic_name, target_date):
                                           or a["Appointment Type"] in ("", "Unknown")):
                 a["Excluded"] = "tooltip not readable"
                 warn(f"[{clinic_name}] {target_date}: '{a['Patient'][:25]}' left out - its "
-                     f"tooltip could not be read in 3 reads; the rest of the day is written "
+                     f"tooltip could not be read; the rest of the day is written "
                      f"and no row of this day is deleted this pass")
     _DAY_VERIFIED[(clinic_name, target_date)] = (not problems) or only_unreadable
 
@@ -3981,7 +3972,7 @@ def scrape_clinic_pt_counts(driver, wait, target_dates, records=None, stop_at=No
                         for appt in appointments:
                             records.append({**base, **appt, "Status": "UNVERIFIED"})
                         warn(f"{clinic_name} | {target_date}: types/counts could not be "
-                             f"confirmed after 3 reads - this day is NOT written to the "
+                             f"confirmed - this day is NOT written to the "
                              f"sheet this pass; its rows stay as they are")
                         skipped_days[target_date] = "types/counts not confirmed"
                         break
